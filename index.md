@@ -5,14 +5,12 @@ This is a place for me to build hypothesis, do experiments, and record my learni
 *****
 ### Projects 
 
-* Customer churn project
-    + [Notebook](https://april507.github.io/Rrrrr/projects/churn/main.html)
-    + [Source code](https://april507.github.io/Rrrrr/projects/churn/main.Rmd) 
+* [Customer churn project](https://april507.github.io/Rrrrr/projects/churn/main.html)
 
 *****
 ### General Guideline
 
-* When making decisions, keep in mind trade-offs based on running speed, explainability, simplicity, performance, and more
+* When making decisions, keep in mind trade-offs between speed, explainability, simplicity, performance, and more
 
 *****
 ### Logistic Regression
@@ -23,7 +21,7 @@ This is a place for me to build hypothesis, do experiments, and record my learni
 * Caret package allows mixing L1 & L2 regularization, want to know if different lambdas can be used in the mixture
 
 *****
-#### Number of folds experiment
+### Number of folds experiment
 
 * Number of folds don't impact model results very much, especially on datasets with large number of rows
 * Results may be unstable when a very small fold is used (<4) 
