@@ -2,22 +2,29 @@
 
 This is a place for me to build hypothesis, do experiments, and record my learnings using various datasets. 
 
+*****
+### Projects 
 
+* [Customer churn project](https://github.com/april507//Rrrrr/projects/churn.html)
 
 *****
-### Guideline
+### General Guideline
 
 * When making decisions, keep in mind trade-offs based on running speed, explainability, simplicity, performance, and more
 
 *****
-### Logistic regression
+### Logistic Regression
 
 * L1, L2, normalization
     + L1 lasso regression (`glmnet alpha==1`), sparse variables
     + L2 ridge regression (`glmnet alpha==0`), smaller coeff, less sensitive to outliers
+* Caret package allows mixing L1 & L2 regularization, want to know if different lambdas can be used in the mixture
 
+*****
 #### Number of folds experiment
 
+* Number of folds don't impact model results very much, especially on datasets with large number of rows
+* Results may be unstable when a very small fold is used (<4) 
 
 *****
 ### Support or Contact
