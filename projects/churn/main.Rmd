@@ -1,0 +1,497 @@
+---
+title: "Customer Churn"
+output: 
+  html_notebook:
+    code_folding: hide
+    highlight: tango
+    theme: flatly
+    toc: yes
+    toc_float:
+      collapsed: yes
+---
+
+## Introduction
+
+* Keep in mind the tradeoffs based on speed, explainability, simplicity & performance
+* Telco customer data is found on [Kaggle](https://www.kaggle.com/blastchar/telco-customer-churn)
+* Goal is to _"Predict behavior to retain customers. You can analyze all relevant customer data and develop focused customer retention programs."_
+* Two ways to think about this problem
+    + On an aggregate level understand which customer groups are more likely to churn, improve esisting service &/ develop program geared towards this group (e.g. month-to-month cutomers are more likely to churn, give promotional offer so they can sign up for longer contract)
+    + On an individual level, rank order customers by probability of churning, and understand why each customer churns / stays, this is done by building a model & shaply value
+
+*****
+## Load data
+```{r, message=FALSE, warning=FALSE}
+options(scipen=999)
+pkgs = c('data.table', 'magrittr', 'caret', 'glmnet', 'ranger', 'plotly', 'iml')
+inst = lapply(pkgs, library, character.only=TRUE)
+source('~/Documents/R/Utils/functions/summarize.R')
+source('~/Documents/R/Utils/functions/model_auc.R')
+source('~/Documents/R/Utils/functions/feature_comparison.R')
+source('~/Documents/R/Utils/functions/helper.R')
+data = fread("~/Documents/R/churn/WA_Fn-UseC_-Telco-Customer-Churn.csv")
+seed = 2018
+head(data)
+```
+
+*****
+## EDA
+### Target distribution
+
+* month-to month contract are more likely to churn
+* fiber optics customers are more likely to churn
+* no internet service customers are less likely to churn
+
+*****
+### Variable correlations
+
+* No internet service from a few variables 
+```{r}
+data[,.N,.(OnlineSecurity=="No internet service", 
+           TechSupport=="No internet service", 
+           InternetService=="No", 
+           DeviceProtection=="No internet service",
+           StreamingMovies=="No internet service", 
+           StreamingTV=="No internet service")]
+```
+
+*****
+
+* age related values: no internet services, etc.
+```{r}
+data[, .(Obs = .N, Churn = sum(Churn=="Yes")/.N), 
+     .(SeniorCitizen, haveInternet = InternetService!="No")]
+```
+
+*****
+
+* tenure vs. total charges / montly charges 
+```{r, fig.width=7, fig.height=4, message=FALSE, warning=FALSE}
+plot_ly(data, x=~tenure, y=~TotalCharges%/%MonthlyCharges) 
+```
+
+*****
+
+* tenure vs. contract
+```{r, fig.width=8, fig.height=4}
+FeatureComparison(list(month2month = data[Contract=="Month-to-month"]$tenure,
+                       oneYear = data[Contract=="One year"]$tenure,
+                       twoYear = data[Contract=="Two year"]$tenure), "tenure")
+```
+
+*****
+### Summarize 
+
+The goal is to find variables with: 
+
+* missing values
+    + Missing in `TotalCharges`: we can remove rows (11 rows) / use mean tenure / most frequent tenure (`1`)
+* low variance
+* outliers
+    
+```{r}
+sum.data = Summarize(data); sum.data
+```
+
+
+*****
+## Feature engineering
+### Train-test split
+```{r, fig.width=8, fig.height=4}
+data.fe = data[!is.na(TotalCharges)][,-1]
+# train-test split
+set.seed(seed)
+index.test = sample(1:nrow(data.fe), nrow(data.fe)%/%20, replace = F)
+data.train = data.fe[-index.test]
+data.test = data.fe[index.test]
+# check to make sure distribution is consistent
+FeatureComparison(list(Train = data.train$Churn, Test = data.test$Churn), 
+                  vectorName = "Churn",
+                  probability = T)
+```
+
+*****
+### One-hot-encoding
+
+* `r sum.data[Class=="character", variable]`
+
+```{r}
+# function
+addFeat <- function(d, feature, value) {
+  newFeat = paste0(feature, "_", make.names(value))
+  d[get(feature) == value, (newFeat) := 1L]
+  d[get(feature) != value, (newFeat) := 0L]
+  d
+}
+onehot <- function(d, feature, values = NULL) {
+  if (is.null(values)) { 
+    values = d[,unique(get(feature))] 
+    if (length(values)==2L) values = values[1]
+  }
+  d = lapply(1:length(values), function(x) addFeat(d, feature, values[x]))[[1]] %>%
+    setDT
+  d[, (feature) := NULL]
+  d
+}
+# encode
+data.oh = copy(data.fe) 
+onehot(data.oh, "gender", "male")
+onehot(data.oh, "Partner", "Yes")
+onehot(data.oh, "Dependents", "Yes")
+onehot(data.oh, "PhoneService", "Yes")
+onehot(data.oh, "MultipleLines")
+onehot(data.oh, "InternetService")
+onehot(data.oh, "OnlineSecurity", c("Yes", "No"))
+onehot(data.oh, "OnlineBackup", c("Yes", "No"))
+onehot(data.oh, "DeviceProtection", c("Yes", "No"))
+onehot(data.oh, "TechSupport", c("Yes", "No"))
+onehot(data.oh, "StreamingTV", c("Yes", "No"))
+onehot(data.oh, "StreamingMovies", c("Yes", "No"))
+onehot(data.oh, "Contract")
+onehot(data.oh, "PaperlessBilling", "Yes")
+onehot(data.oh, "PaymentMethod")
+# split
+dataOH.train = data.oh[-index.test]
+dataOH.test = data.oh[index.test]
+```
+
+*****
+### Additional work
+
+TBD
+
+*****
+## Model build {.tabset}
+### glmnet
+
+* Consistent results when nfolds >= 10
+* L1 is always better than L2
+    + easier for production, keeping track
+    + need to make sure distributions of these variables don't change over time
+
+```{r, fig.width=9, fig.height=4}
+xlr = model.matrix(Churn ~ ., data = data.fe)[,-1]
+ylr = data.fe$Churn
+# build models
+buildLR <- function(alpha, nfolds, seed = 2018) {
+  # alpha = 1 is lasso, alpha = 0 is ridge
+  set.seed(seed)
+  model = cv.glmnet(xlr[-index.test,], ylr[-index.test], 
+                    alpha = alpha, nfolds = nfolds, family = "binomial")
+  pred = predict(model, s = model$lambda.min, 
+                 newx = xlr[index.test,], type = "response")[,1]
+  data.table(alpha = alpha, nfolds = nfolds, lambda = model$lambda.min,
+             auc = CalcAUC(scores = pred, target = data.fe[index.test, Churn=="No"]))
+}
+# check parameter
+plr = purrr::map2_dfr(.x = rep(0:1, each = 18), .y = rep(3:20, 2), buildLR) %>%
+  setDT %>%
+  .[alpha==0, regularization := "L2"] %>%
+  .[alpha==1, regularization := "L1"]
+plot_ly(plr, x = ~nfolds, y = ~lambda, color = ~regularization, 
+        colors = c("red", "blue")) %>% add_markers()
+```
+
+*****
+
+* A few lambda values are consistently chosen although a lot of values are tested
+
+```{r, fig.width=9, fig.height=4}
+# build models
+set.seed(seed)
+mlr.l1 = cv.glmnet(xlr[-index.test,], ylr[-index.test], alpha = 1, nfolds = 10, family = "binomial")
+set.seed(seed)
+mlr.l2 = cv.glmnet(xlr[-index.test,], ylr[-index.test], alpha = 0, nfolds = 10, family = "binomial")
+
+# check parameter
+buildLR2 <- function(alpha, i) {
+  model = if (alpha==1) mlr.l1 else mlr.l2
+  pred = predict(model, s = model$lambda[i], newx = xlr[index.test,], type = "response")[,1]
+  data.table(alpha = alpha, lambda = model$lambda[i],
+             auc = CalcAUC(scores = pred, target = data.fe[index.test, Churn=="No"]))
+}
+plr2 = purrr::map2_dfr(.x = rep(1, length(mlr.l1$lambda)), 
+                       .y = 1:length(mlr.l1$lambda), buildLR2) %>%
+  rbind(purrr::map2_dfr(.x = rep(0, length(mlr.l2$lambda)), 
+                       .y = 1:length(mlr.l2$lambda), buildLR2)) %>%
+  setDT %>%
+  .[alpha==0, regularization := "L2"] %>%
+  .[alpha==1, regularization := "L1"]
+# plot
+plot_ly(plr2, y = ~auc, x = ~lambda, color = ~regularization, 
+        colors = c("red", "blue")) %>% add_markers()
+```
+
+*****
+
+* Final model -- lasso regression has better performance
+
+```{r, fig.width=7, fig.height=4}
+pred.l1 = predict(mlr.l1, s = mlr.l1$lambda.min, newx = xlr[index.test,], type = "response")[,1]
+pred.l2 = predict(mlr.l2, s = mlr.l2$lambda.min, newx = xlr[index.test,], type = "response")[,1]
+ModelAUC(scores = data.table(Lasso = pred.l1, Ridge = pred.l2),
+         target = data.test[, Churn=="No"])
+```
+
+*****
+```{r}
+coef(mlr.l1)
+```
+
+*****
+### Logistic Regression (caret)
+
+* `selectionFunction` allows to change 
+    + `best`, `oneSE`, `tolerance`
+* Change the evaluation metrics to AUC
+* We define search values since only 3 values are used by default
+* Caret chose lasso regression as the best model
+
+```{r}
+# 10-fold CV
+set.seed(seed)
+clr <- trainControl(method = "repeatedcv", number = 10, repeats = 5, 
+                    classProbs = TRUE, summaryFunction = twoClassSummary)
+# search grid
+glr <-  expand.grid(alpha = 0:10/10, lambda = 10^seq(3,-6))
+# model                        
+set.seed(seed)
+mlr <- train(as.factor(Churn) ~ ., data = data.train, 
+             method = "glmnet", trControl = clr, tuneGrid = glr, metric = "ROC")
+plot(mlr)
+```
+
+```{r}
+mlr$bestTune
+```
+
+*****
+### RandomForest 
+
+* Gini is better than extratrees
+* Gini at 4 features is consistently better
+* Higher AUC as min node size goes higher, but with diminishing return
+* 10-fold
+
+```{r}
+# input
+xrf = copy(data.fe) 
+xrf = xrf[, lapply(.SD, as.factor), 
+          .SDcols = sum.data[Class=="character" & variable!="customerID", as.character(variable)]] %>%
+  cbind(xrf[, mget(sum.data[Class!="character", as.character(variable)])])
+# search grid
+grf <-  expand.grid(mtry = 1:5*4, 
+                    splitrule = c("gini", "extratrees"),
+                    min.node.size = 1:5*20)
+#                       ntree = c(seq(10, 90, 10), seq(100, 900, 100), seq(1000, 10000, 1000)))
+# 10-fold CV
+set.seed(seed)
+crf10 <- trainControl(method = "repeatedcv", number = 10, repeats = 1, 
+                    classProbs = TRUE, summaryFunction = twoClassSummary)
+# model                        
+set.seed(seed)
+mrf <- train(as.factor(Churn) ~ ., data = xrf[-index.test], 
+             method = 'ranger', trControl = crf10, tuneGrid = grf, metric = "ROC")
+plot(mrf)
+```
+
+```{r}
+mrf$bestTune
+```
+
+*****
+### RandomForest (one-hot)
+```{r}
+# 10-fold CV
+set.seed(seed)
+crf <- trainControl(method = "repeatedcv", number = 10, repeats = 1, 
+                    classProbs = TRUE, summaryFunction = twoClassSummary)
+# search grid
+grf <-  expand.grid(mtry = 1:5*4, 
+                    splitrule = c("gini", "extratrees"),
+                    min.node.size = 1:5*20)
+# model                        
+set.seed(seed)
+moh <- train(as.factor(Churn) ~ ., data = dataOH.train, 
+             method = 'ranger', trControl = crf, tuneGrid = grf, metric = "ROC")
+plot(moh)
+```
+
+```{r}
+moh$bestTune
+```
+
+*****
+### Performance
+
+* Ridge regression has worst performance -- could be b/c some features are not predictive at all
+* Mixed logistic regression has same performance as lasso -- we prefer lasso, since it's simplier
+* Two RF models have better performance 
+
+```{r, fig.width=7, fig.height=4}
+pred.lr = predict(mlr, newdata = data.test, type = "prob")[,2]
+pred.rf = predict(mrf, newdata = data.test, type = "prob")[,2]
+pred.oh = predict(moh, newdata = dataOH.test, type = "prob")[,2]
+ModelAUC(scores = data.table(Lasso = pred.l1, Ridge = pred.l2, 
+                             Mixed = pred.lr, RF = pred.rf, RFOneHot = pred.oh),
+         target = data.test[, Churn=="No"])
+```
+
+*****
+## Model explain {.tabset}
+
+* [iml package](https://cran.r-project.org/web/packages/iml/vignettes/intro.html)
+* We use predicted probability to target individual customers, and use this to build customer retention strategy
+    + rank order new customers by the probability of churing, focus on retaining customers who are most likely to churn
+    + use important features to target customer groups
+    + use shapley to inform us what makes each customer churn
+
+### Permutation impact
+
+* Which features are most / least important?
+* Most important features are `r impRF$results[1:4, 1]`
+    + We will run PDP to see how each variable affects customer churn
+* We may also try removing the bottom features to get a better model
+```{r}
+set.seed(seed)
+modelRF = Predictor$new(mrf, data = data.frame(data.train), y = "Churn", type = "prob")
+impRF = FeatureImp$new(modelRF, loss = "ce")
+plot(impRF) #imp$results
+```
+
+*****
+
+* One-hot-encoding: 
+```{r}
+set.seed(seed)
+modelOH = Predictor$new(moh, data = data.frame(dataOH.train), y = "Churn", type = "prob")
+impOH = FeatureImp$new(modelOH, loss = "ce")
+plot(impOH) #imp$results
+```
+
+*****
+### PDP {.tabset}
+
+* How does the model use each variable?
+* Be ware of correlation vs. causation
+    + e.g. Customer with paperless billing are more likely to churn, doesn't necessarily mean if we let them sign up for paper billing then they will not churn
+
+#### Internet Service
+
+* Fiber optic customers are more likely to churn
+
+```{r}
+pdpRF = FeatureEffect$new(modelRF, method = "pdp", feature = "InternetService")
+pdpRF$plot()
+```
+
+*****
+```{r}
+pdpOH = FeatureEffect$new(modelOH, method = "pdp", feature = "InternetService_Fiber.optic")
+pdpOH$plot()
+```
+
+*****
+```{r}
+pdpOH = FeatureEffect$new(modelOH, method = "pdp", feature = "InternetService_No")
+pdpOH$plot()
+```
+
+*****
+#### Tenure
+```{r}
+pdpRF$set.feature("tenure"); pdpRF$plot()
+```
+
+*****
+```{r}
+pdpOH$set.feature("tenure"); pdpOH$plot()
+```
+
+*****
+#### Contract
+```{r}
+pdpRF$set.feature("Contract"); pdpRF$plot()
+```
+
+*****
+```{r}
+pdpOH$set.feature("Contract_Month.to.month"); pdpOH$plot()
+```
+
+*****
+#### Paperless billing
+```{r}
+pdpRF$set.feature("PaperlessBilling"); pdpRF$plot()
+```
+
+*****
+#### Total charges
+```{r}
+pdpRF$set.feature("TotalCharges"); pdpRF$plot()
+```
+
+*****
+```{r}
+pdpOH$set.feature("TotalCharges"); pdpOH$plot()
+```
+
+*****
+#### Monthly charges
+```{r}
+pdpRF$set.feature("MonthlyCharges"); pdpRF$plot()
+```
+
+*****
+```{r}
+pdpOH$set.feature("MonthlyCharges"); pdpOH$plot()
+```
+
+*****
+### Shapley (individual)
+
+* What makes each customer churn / stay?
+* customer is predicted to churn with a probability of `r modelRF$predict(data.test[100])[[2]]*100`%
+
+```{r}
+i = 100
+shapleyRF = Shapley$new(modelRF, x.interest = data.frame(data.test[, -"Churn"][i, ]))
+shapleyRF$plot()
+```
+
+*****
+* customer is predicted to churn with a probability of `r modelOH$predict(dataOH.test[100])[[2]]*100`%
+
+```{r}
+i = 100
+shapleyOH = Shapley$new(modelOH, x.interest = data.frame(dataOH.test[, -"Churn"][i, ]))
+shapleyOH$plot()
+```
+
+*****
+### Shapley (aggregate)
+
+* TBD
+```{r}
+
+```
+
+*****
+## Conclusion
+#### General
+
+* Given that the dataset only has ~20 features, we don't have to build a ML model to inform us what customer group to focus on -- e.g. we have identified month-to-month & fiber optics customers are more likely to churn even before making the model. However, building the model allows us to identify customers who are most like to churn and understand on an individual level what makes a customer churn so we can be more proactive.
+
+#### Explainability 
+
+* Permutation impact (PI) with one-hot-encoded RF model gives more insight in what specific values / groups drive customer churn
+* However, PI results are less stable and varies with different seeds -- e.g. monthly charges hurts the normal RF model, but is very important for the RF model with one-hot-encoding
+* Aggregate Shapley seem to be more stable than permutation impact, in giving consistent results and showing most important variables in the decision. It gives the same rank order of top churning reasons with both RF models
+* On the other hand, one-hot-encoding seems to give weird results for shapley, for e.g. customer is predicted to churn b/c of using fiber optics internet, and also b/c of not using DSL -- which should be combined together
+* In conclusion, this dataset suggests factorized RF is better than one-hot-encoded RF in both perdicting power and explainability
+
+*****
+```{r, eval=FALSE}
+save(xlr, ylr, plr, plr2, mlr.l1, mlr.l2, mlr, mrf, moh, file = "model.RData")
+load("model.RData")
+```

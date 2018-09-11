@@ -5,7 +5,9 @@ This is a place for me to build hypothesis, do experiments, and record my learni
 *****
 ### Projects 
 
-* [Customer churn project](https://github.com/april507//Rrrrr/projects/churn.html)
+* Customer churn project
+    + [Notebook](https://april507.github.io/Rrrrr/projects/churn/main.html)
+    + [Source code](https://april507.github.io/Rrrrr/projects/churn/main.Rmd) 
 
 *****
 ### General Guideline
