@@ -1,0 +1,661 @@
+---
+title: "Bike Sharing"
+output: 
+  html_notebook:
+    code_folding: hide
+    highlight: tango
+    theme: flatly
+    toc: yes
+    toc_float:
+      collapsed: yes
+---
+
+## Introduction
+
+* Keep in mind the tradeoffs based on speed, explainability, simplicity & performance
+* Bike sharing data is found on [Kaggle](https://www.kaggle.com/marklvl/bike-sharing-dataset/home)
+* Potential things to explore: 
+    + Duration of travel, departure and arrival position
+    + Casual vs. registered rental wrt weather, time, etc.
+    + Understand seasonality / time series analysis
+    + Predict number of rentals on a day
+    + Event and Anomaly Detection
+    
+*****
+## Data
+### Sample
+```{r, message=FALSE, warning=FALSE}
+options(scipen=999)
+seed = 2018
+pkgs = c('data.table', 'magrittr', 'caret', 'glmnet', 'ranger', 'plotly', 'iml')
+inst = lapply(pkgs, library, character.only=T, quietly=T); rm(pkgs, inst)
+source('~/Documents/R/Utils/functions/summarize.R')
+source('~/Documents/R/Utils/functions/one_hot.R')
+source('~/Documents/R/Utils/functions/model_auc.R')
+source('~/Documents/R/Utils/functions/feature_comparison.R')
+source('~/Documents/R/Utils/functions/feature_distribution.R')
+source('~/Documents/R/Utils/functions/helper.R')
+day = fread("~/Rrrrr/projects/bike_sharing/day.csv") %>%
+  .[, dteday := as.Date(dteday)]
+hour = fread("~/Rrrrr/projects/bike_sharing/hour.csv") %>%
+  .[, dteday := as.Date(dteday)]
+head(day)
+```
+
+*****
+### Summarize {.tabset}
+
+The goal is to find variables with: 
+
+* missing values
+* low variance
+* outliers -- casual users shows the most diverse behavior
+   
+#### Day 
+```{r}
+sum.day = Summarize(day); DT::datatable(sum.day, options = list(dom = "tip"))
+```
+
+*****
+#### Hour
+```{r}
+sum.hour = Summarize(hour); DT::datatable(sum.hour, options = list(dom = "tip"))
+```
+*****
+### Learnings
+
+* Holiday is only marked for weekdays
+```{r}
+day[,.N,.(weekday, workingday, holiday)]
+```
+
+*****
+## Anomaly detection EDA {.tabset}
+
+* Given condition, actual rental is way higher than predicted rentals, especially casual renters on days of events
+* Time of rental -- might be a peak at certain time
+* My guess is holiday is more likely to have events -- only 21 holidays
+* Holiday & weekends people might use bikes on a longer stretch of time
+* Clustering on raw features & on shapley values
+
+### Feature Density
+```{r, fig.width=8, fig.height=4}
+FeatureComparison(list(holiday = day[holiday==1, cnt], 
+                       weekday = day[holiday==0 & workingday==1, cnt],
+                       weekend = day[holiday==0 & workingday==0, cnt]),
+                  vectorName = "Total rental", sample = F, numerical = T)
+```
+
+*****
+```{r, fig.width=8, fig.height=4}
+FeatureComparison(list(holiday = day[holiday==1, casual], 
+                       weekday = day[holiday==0 & workingday==1, casual],
+                       weekend = day[holiday==0 & workingday==0, casual]),
+                  vectorName = "Casual rental", sample = F, numerical = T)
+```
+
+*****
+```{r, fig.width=8, fig.height=4}
+FeatureComparison(list(holiday = day[holiday==1, registered], 
+                       weekday = day[holiday==0 & workingday==1, registered],
+                       weekend = day[holiday==0 & workingday==0, registered]),
+                  vectorName = "Registered rental", sample = T, numerical = T)
+```
+
+### Feature Over Time
+
+* `2012-10-29` & `2012-10-30` why is it so low?
+    + Hurricane Sandy
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(weekday = day[holiday==0 & workingday==1],
+                         weekend = day[holiday==0 & workingday==0],
+                         holiday = day[holiday==1], overall = day),
+                    featureName = "cnt", periodName = "dteday")
+```
+
+*****
+
+* Casual users show the most diverse behaviors between holiday, weekends & weekdays
+* `2011-07-04` is very high -- 4th of July!
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(weekday = day[holiday==0 & workingday==1],
+                         weekend = day[holiday==0 & workingday==0],
+                         holiday = day[holiday==1], overall = day),
+                    featureName = "casual", periodName = "dteday")
+```
+
+*****
+
+* Looks like registered users like to use more during weekdays, which makes sense as the registered users use bikes as work commute transportation
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(weekday = day[holiday==0 & workingday==1],
+                         weekend = day[holiday==0 & workingday==0],
+                         holiday = day[holiday==1], overall = day),
+                    featureName = "registered", periodName = "dteday")
+```
+
+*****
+### Weather
+
+* Casual users like to bike on cooler days during summer, and clearer days in spring & fall
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(Clear = day[weathersit==1], 
+                         Mist = day[weathersit==2],
+                         Light = day[weathersit==3]),
+                    featureName = "casual", periodName = "mnth")
+```
+
+*****
+
+* Again, weather has less effect on registered users (similar to weekdays)
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(Clear = day[weathersit==1], 
+                         Mist = day[weathersit==2],
+                         Light = day[weathersit==3]),
+                    featureName = "registered", periodName = "mnth")
+```
+
+*****
+### Day of week
+
+* Casual rental: Saturdays & Sundays are heavy days
+```{r, fig.width=8, fig.height=4}
+FeatureComparison(list(S = day[weekday==0, casual], 
+                       M = day[weekday==1, casual],
+                       T = day[weekday==2, casual],
+                       W = day[weekday==3, casual],
+                       Th = day[weekday==4, casual],
+                       F = day[weekday==5, casual],
+                       St = day[weekday==6, casual]),
+                  vectorName = "Casual rental", sample = F, numerical = T)
+```
+
+*****
+
+* Registered rental: Wednesdays & Thursdays are heavy days
+```{r, fig.width=8, fig.height=4}
+FeatureComparison(list(S = day[weekday==0, registered], 
+                       M = day[weekday==1, registered],
+                       T = day[weekday==2, registered],
+                       W = day[weekday==3, registered],
+                       Th = day[weekday==4, registered],
+                       F = day[weekday==5, registered],
+                       St = day[weekday==6, registered]),
+                  vectorName = "Registered rental", sample = F, numerical = T)
+```
+
+*****
+
+### Time 
+
+* Starting from 0, every 15$^\circ$ is one hour; so 120$^\circ$ means 8am and 255$^\circ$ means 5pm
+* How far the dot is from origin is the average number of users during that time
+
+* Casual users
+    + Rentals on Saturday > Sunday > Weekdays
+    + More rentals in the afternoon on weekends
+    + Most weekday rental at ~5pm
+* Registered users
+    + More rentals during weekdays > weekends, Saturday & Sunday uses are not very different
+    + Peak hours are 8am, 5pm & 6pm during weekdays
+```{r, fig.width=7}
+time = hour[workingday==1, .(day = "Weekday", c = mean(casual), r = mean(registered)), hr] %>%
+  rbind(hour[weekday==6, .(day = "Sat", c = mean(casual), r = mean(registered)), hr]) %>%
+  rbind(hour[weekday==0, .(day = "Sun", c = mean(casual), r = mean(registered)), hr]) %>%
+  .[, deg := hr*15] %>%
+  .[, let := LETTERS[hr+1]]
+# plot_ly(time, x=~hr, y=~cnt, color = ~day) 
+p <- plot_ly(type = 'scatterpolar', mode = 'markers', 
+             r = time[day=="Weekday"]$c,
+             theta = time[day=="Weekday"]$deg,
+             name = "Casual_Week", marker = list(opacity = 0.5)) %>%
+  add_trace(type = 'scatterpolar', mode = 'markers', 
+            r = time[day=="Sat"]$c,
+            theta = time[day=="Sat"]$deg,
+            name = "Casual_Sat", marker = list(opacity = 0.5)) %>%
+  add_trace(type = 'scatterpolar', mode = 'markers', 
+            r = time[day=="Sun"]$c,
+            theta = time[day=="Sun"]$deg,
+            name = "Casual_Sun", marker = list(opacity = 0.5)) %>%
+  add_trace(type = 'scatterpolar', mode = 'markers', 
+            r = time[day=="Weekday"]$r,
+            theta = time[day=="Weekday"]$deg,
+            name = "Reg_Week",
+            marker = list(opacity = 0.5)) %>%
+  add_trace(type = 'scatterpolar', mode = 'markers', 
+            r = time[day=="Sat"]$r,
+            theta = time[day=="Sat"]$deg,
+            name = "Reg_Sat",
+            marker = list(opacity = 0.5)) %>%
+  add_trace(type = 'scatterpolar', mode = 'markers', 
+            r = time[day=="Sun"]$r,
+            theta = time[day=="Sun"]$deg,
+            name = "Reg_Sun",
+            marker = list(opacity = 0.5)) %>%
+  layout(polar = list(radialaxis = list(angle = 0),
+                      angularaxis = list(direction = 'clockwise', dtick = 15)))
+
+p
+```
+
+*****
+### Holiday
+
+* 21 Holidays -- easy to spot days with events
+```{r}
+day[,.N, .(holiday, workingday)]
+```
+
+```{r}
+day[holiday==1,.(dteday, yr, weekday, casual, registered, cnt)]
+```
+
+*****
+* Time
+```{r}
+hour[dteday=="2011-07-04",.(hr, weathersit, temp, atemp, hum, windspeed, casual, registered, cnt)]
+```
+
+*****
+## Regression
+### Train-test split
+
+* Time split
+```{r, fig.width=8, fig.height=4}
+cutoff = "2012-09-01"
+# train-test split by time
+data.train = hour[dteday<cutoff, -c("instant", "dteday", "casual", "registered")]
+week.train = hour[dteday<cutoff] %>% .[, week := week(dteday)] %>%
+  .[, -c("instant", "dteday", "casual", "registered")]
+date.train = hour[dteday<cutoff] %>% .[, week := week(dteday)] %>%
+  .[, date := mday(dteday)] %>%
+  .[, -c("instant", "dteday", "casual", "registered")]
+cas.train = hour[dteday<cutoff]$casual
+reg.train = hour[dteday<cutoff]$registered
+data.test = hour[dteday>=cutoff, -c("instant", "dteday", "casual", "registered")]
+week.test = hour[dteday>=cutoff] %>% .[, week := week(dteday)] %>%
+  .[, -c("instant", "dteday", "casual", "registered")]
+date.test = hour[dteday>=cutoff] %>% .[, week := week(dteday)] %>%
+  .[, date := mday(dteday)] %>%
+  .[, -c("instant", "dteday", "casual", "registered")]
+# check to make sure distribution is consistent
+FeatureDistribution(list(Train = hour[dteday<cutoff], 
+                         Test = hour[dteday>=cutoff]),
+                    featureName = "cnt", periodName = "dteday")
+```
+
+*****
+### One-hot-encoding
+
+* Season & weekday
+```{r}
+hour.ohot = copy(hour)
+OneHot(hour.ohot, "mnth")
+OneHot(hour.ohot, "hr")
+OneHot(hour.ohot, "season")
+OneHot(hour.ohot, "weekday")
+OneHot(hour.ohot, "weathersit")
+ohot.train = hour.ohot[dteday<cutoff, -c("instant", "dteday", "casual", "registered")]
+ohot.test = hour.ohot[dteday>=cutoff, -c("instant", "dteday", "casual", "registered")]
+```
+
+*****
+### Additional work
+
+* Identify & remove outliers
+```{r}
+
+```
+
+*****
+### Model build {.tabset}
+
+* Train with entire dataset
+* Train with events (`0`/`1`) column
+* Train separate models for registered vs. casual users
+    + Exact
+* Evaluation metric determines how good a model is, for e.g. RMSE means predicted values are in a narrow band in comparison to MAE
+
+#### GLM
+```{r}
+# 10-fold CV
+set.seed(seed)
+glm.ctr <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+# search grid
+glm.grd <-  expand.grid(alpha = 0:10/10, lambda = 10^seq(3,-6))
+# model                        
+set.seed(seed)
+glm.all <- train(x = ohot.train[,-"cnt"], y = ohot.train$cnt, 
+                 method = "glmnet", trControl = glm.ctr, tuneGrid = glm.grd)
+plot(glm.all)
+```
+
+*****
+```{r}
+glm.all$bestTune
+```
+
+*****
+
+* RMSE = `r pred.glm[, mean((actual - pred)^2)] %>% sqrt`
+* RMSE results in conservative predictions -- predicted values are all < 600
+```{r, fig.width=8, fig.height=4}
+pred.glm = data.table(actual = ohot.test$cnt, 
+                      pred = predict(glm.all, newdata = ohot.test))
+plot_ly(pred.glm, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+
+* In comparison, RMSE on train = `r pred.glm.train[, mean((actual - pred)^2)] %>% sqrt`
+* GLM has a higher bias
+```{r, fig.width=8, fig.height=4}
+pred.glm.train = data.table(actual = ohot.train$cnt, 
+                            pred = predict(glm.all, newdata = ohot.train))
+plot_ly(pred.glm.train, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+#### GLM(2models) {.tabset}
+##### Casual model
+```{r}
+# model                        
+set.seed(seed)
+glm.cas <- train(x = ohot.train[,-"cnt"], y = cas.train, 
+                 method = "glmnet", trControl = glm.ctr, tuneGrid = glm.grd)
+plot(glm.cas)
+```
+
+*****
+```{r}
+glm.cas$bestTune
+```
+
+*****
+##### Registered model
+```{r}
+set.seed(seed)
+glm.reg <- train(x = ohot.train[,-"cnt"], y = reg.train, 
+                 method = "glmnet", trControl = glm.ctr, tuneGrid = glm.grd)
+plot(glm.reg)
+```
+
+*****
+```{r}
+glm.reg$bestTune
+```
+
+*****
+##### Performance
+
+```{r, fig.width=8, fig.height=4}
+# * RMSE = `r glm.two[, mean((actual - pred)^2)] %>% sqrt`
+glm.two = data.table(hour[dteday>=cutoff, .(actual = cnt, dteday)],
+                      cas = predict(glm.cas, newdata = hour)[14492:17379],
+                      reg = predict(glm.reg, newdata = hour)[14492:17379]) %>%
+  .[, pred := cas + reg]
+plot_ly(glm.two, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+```{r, fig.width=8, fig.height=4}
+FeatureComparison(list(glm.two$actual, glm.two$pred))
+```
+
+*****
+
+* Average hourly prediction
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(Train = hour[dteday<cutoff,.(dteday, group = "train", value = cnt)],
+                         Test = glm.two[,.(dteday, group = "actual", value = actual)],
+                         Preds = glm.two[,.(dteday, group = "pred", value = pred)]), 
+                    featureName = "value", periodName = "dteday")
+```
+
+*****
+#### XGB
+
+* `nrounds (# Boosting Iterations)`, `max_depth (Max Tree Depth)`, `eta (Shrinkage)`, `gamma (Minimum Loss Reduction)`, `colsample_bytree (Subsample Ratio of Columns)`, `min_child_weight (Minimum Sum of Instance Weight)`, `subsample`
+```{r}
+# 10-fold CV
+set.seed(seed)
+xgb.ctr <- trainControl(method = "repeatedcv", number = 10, repeats = 1)
+# search grid
+# glm.grd <-  expand.grid(alpha = 0:10/10, lambda = 10^seq(3,-6))
+# model                        
+set.seed(seed)
+xgb.all <- train(x = data.train[,-"cnt"], y = data.train$cnt, 
+                 method = "xgbTree", trControl = xgb.ctr)
+plot(xgb.all)
+```
+
+*****
+```{r}
+xgb.all$bestTune
+```
+
+*****
+##### Performance
+
+* RMSE = `r pred.xgb[, mean((actual - pred)^2)] %>% sqrt`
+```{r, fig.width=8, fig.height=4}
+pred.xgb = data.table(actual = data.test$cnt, 
+                      pred = predict(xgb.all, newdata = data.test))
+plot_ly(pred.xgb, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+* In comparison, RMSE on train = `r pred.xgb.train[, mean((actual - pred)^2)] %>% sqrt`
+```{r, fig.width=8, fig.height=4}
+pred.xgb.train = data.table(actual = data.train$cnt, 
+                            pred = predict(xgb.all, newdata = data.train))
+plot_ly(pred.xgb.train, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+#### XGB(2models) {.tabset}
+
+* Slightly performance as the normal XGB model
+ 
+##### Casual model
+```{r}
+set.seed(seed)
+xgb.cas <- train(x = data.train[,-"cnt"], y = cas.train, 
+                 method = "xgbTree", trControl = xgb.ctr)
+plot(xgb.cas)
+```
+
+*****
+```{r}
+xgb.cas$bestTune
+```
+
+*****
+##### Registered model
+```{r}
+set.seed(seed)
+xgb.reg <- train(x = data.train[,-"cnt"], y = reg.train, 
+                 method = "xgbTree", trControl = xgb.ctr)
+plot(xgb.reg)
+```
+
+*****
+```{r}
+xgb.reg$bestTune
+```
+
+*****
+##### Performance
+
+* RMSE = `r pred.two[, mean((actual - pred)^2)] %>% sqrt`
+```{r, fig.width=8, fig.height=4}
+pred.two = data.table(hour[dteday>=cutoff, .(actual = cnt, dteday)],
+                      cas = predict(xgb.cas, newdata = data.test),
+                      reg = predict(xgb.reg, newdata = data.test)) %>%
+  .[, pred := cas + reg]
+plot_ly(pred.two, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+```{r, fig.width=8, fig.height=4}
+FeatureComparison(list(pred.two$actual, pred.two$pred))
+```
+
+*****
+
+* Average hourly prediction
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(Train = hour[dteday<cutoff,.(dteday, group = "train", value = cnt)],
+                         Test = pred.two[,.(dteday, group = "actual", value = actual)],
+                         Preds = pred.two[,.(dteday, group = "pred", value = pred)]), 
+                    featureName = "value", periodName = "dteday")
+```
+
+*****
+#### XGB(week)
+```{r}
+# 10-fold CV
+set.seed(seed)
+xgb.ctr <- trainControl(method = "repeatedcv", number = 10, repeats = 1)
+# search grid
+# glm.grd <-  expand.grid(alpha = 0:10/10, lambda = 10^seq(3,-6))
+# model                        
+set.seed(seed)
+xgb.week <- train(x = week.train[,-"cnt"], y = week.train$cnt, 
+                 method = "xgbTree", trControl = xgb.ctr)
+plot(xgb.week)
+```
+
+*****
+```{r}
+xgb.week$bestTune
+```
+
+*****
+
+* RMSE = `r week.xgb[, mean((actual - pred)^2)] %>% sqrt`
+```{r, fig.width=8, fig.height=4}
+week.xgb = data.table(hour[dteday>=cutoff, .(actual = cnt, dteday)],
+                      pred = predict(xgb.week, newdata = week.test))
+plot_ly(week.xgb, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+
+* Average hourly prediction
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(Train = hour[dteday<cutoff,.(dteday, group = "train", value = cnt)],
+                         Test = week.xgb[,.(dteday, group = "actual", value = actual)],
+                         Preds = week.xgb[,.(dteday, group = "pred", value = pred)]), 
+                    featureName = "value", periodName = "dteday")
+```
+
+*****
+#### XGB(date)
+```{r}
+set.seed(seed)
+xgb.date <- train(x = date.train[,-"cnt"], y = date.train$cnt, 
+                 method = "xgbTree", trControl = xgb.ctr)
+plot(xgb.date)
+```
+
+*****
+```{r}
+xgb.date$bestTune
+```
+
+*****
+
+* RMSE = `r date.xgb[, mean((actual - pred)^2)] %>% sqrt`
+```{r, fig.width=8, fig.height=4}
+date.xgb = data.table(hour[dteday>=cutoff, .(actual = cnt, dteday)],
+                      pred = predict(xgb.date, newdata = date.test))
+plot_ly(date.xgb, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+
+* Average hourly prediction
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(Train = hour[dteday<cutoff,.(dteday, group = "train", value = cnt)],
+                         Test = date.xgb[,.(dteday, group = "actual", value = actual)],
+                         Preds = date.xgb[,.(dteday, group = "pred", value = pred)]), 
+                    featureName = "value", periodName = "dteday")
+```
+
+*****
+#### XGB(no mnth)
+```{r}
+set.seed(seed)
+xgb.mth <- train(x = data.train[,-c("mnth","cnt")], y = data.train$cnt, 
+                 method = "xgbTree", trControl = xgb.ctr)
+plot(xgb.mth)
+```
+
+*****
+```{r}
+xgb.mth$bestTune
+```
+
+*****
+##### Performance
+
+* RMSE = `r mth.xgb[, mean((actual - pred)^2)] %>% sqrt`
+```{r, fig.width=8, fig.height=4}
+mth.xgb = data.table(hour[dteday>=cutoff, .(actual = cnt, dteday)],
+                     pred = predict(xgb.mth, newdata = data.test))
+plot_ly(mth.xgb, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+* In comparison, RMSE on train = `r mth.xgb.train[, mean((actual - pred)^2)] %>% sqrt`
+```{r, fig.width=8, fig.height=4}
+mth.xgb.train = data.table(actual = data.train$cnt, 
+                           pred = predict(xgb.mth, newdata = data.train))
+plot_ly(mth.xgb.train, x = ~actual, y = ~pred) %>%
+  add_markers() %>%
+  add_lines(x=c(1,800), y=c(1,800), showlegend = F)
+```
+
+*****
+### Performance
+
+```{r, fig.width=8, fig.height=4}
+FeatureDistribution(list(Train = hour[dteday<cutoff,.(dteday, group = "train", value = cnt)],
+                         Test = date.xgb[,.(dteday, group = "actual", value = actual)],
+                         NoMth = mth.xgb[,.(dteday, group = "pred", value = pred)],
+                         XGB2 = pred.two[,.(dteday, group = "pred", value = pred)],
+                         Week = week.xgb[,.(dteday, group = "pred", value = pred)],
+                         Date = date.xgb[,.(dteday, group = "pred", value = pred)]), 
+                    featureName = "value", periodName = "dteday")
+```
+
+*****
+## Explain
+```{r}
+#calc.relimp
+```
+
+*****
+```{r, eval=FALSE}
+save.image(file = "bike.RData")
+load("bike.RData")
+```
